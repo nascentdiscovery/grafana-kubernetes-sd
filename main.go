@@ -1,90 +1,110 @@
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
 package main
 
 import (
-    // "time"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
-    "bytes"
-    "net/http"
-    "io/ioutil"
-    "encoding/json"
+	"net/http"
 
 	"github.com/ericchiang/k8s"
 )
+
 type Datasource struct {
-    Name string `json:"name"`
-    Type string `json:"type"`
-    Access string `json:"access"`
-    Url string `json:"url"`
+	Name   string `json:"name"`
+	Type   string `json:"type"`
+	Access string `json:"access"`
+	Url    string `json:"url"`
 }
 
-type Datasources struct {
-    Items []Datasource `json:"datasources"`
-}
-
-func (ds *Datasources) AddDatasource(datasource Datasource) []Datasource {
-    ds.Items = append(ds.Items, datasource)
-    return ds.Items
-}
-
-func buildList() Datasources{
+func getWatch() *k8s.CoreV1ServiceWatcher {
 	client, err := k8s.NewInClusterClient()
-    var dss Datasources
 	if err != nil {
 		log.Fatal(err)
 	}
 	ls := new(k8s.LabelSelector)
 	ls.Eq("app", "prometheus")
 
-	pods, err := client.CoreV1().ListPods(context.Background(), k8s.AllNamespaces, ls.Selector())
+	servicewatch, err := client.CoreV1().WatchServices(context.Background(), k8s.AllNamespaces, ls.Selector())
 	if err != nil {
 		log.Fatal(err)
 	}
-    fmt.Println("damn")
-	for _, pod := range pods.Items {
-        dns := *pod.Metadata.Name + "." + *pod.Metadata.Namespace + ".svc.cluster.local"
-        ds := Datasource{Name: dns, Type: "prometheus", Access: "proxy", Url: dns}
-        dss.AddDatasource(ds)
-        // fmt.Println("+%v", dns)
-        // fmt.Println("WTF")
-        // fmt.Println("+%v", ds)
+	return servicewatch
+}
+func watchLoop(servicewatch *k8s.CoreV1ServiceWatcher) {
+	for {
+		eventtype, pod, err := servicewatch.Next()
+		if err != nil {
+			log.Fatal(err)
+			break
+		}
+		podname := *pod.Metadata.Name + "." + *pod.Metadata.Namespace
+		dns := podname + ".svc.cluster.local"
+		if *eventtype.Type == "DELETED" {
+			RemoveDataSource(podname)
+		} else {
+			if *eventtype.Type == "ADDED" {
+				url := "http://" + dns + ":9090"
+				ds := Datasource{Name: podname, Type: "prometheus", Access: "proxy", Url: url}
+				AddDataSource(ds)
+			}
+		}
 	}
-    // for _, d := range dss.Items {
-    //     fmt.Println(d)
-    // }
-
-    return dss
 }
 
 func main() {
-    fmt.Println("What")
-    dss := buildList()
-    for _, d := range dss.Items {
-        fmt.Println(d)
-    }
-    // time.Sleep(60 * time.Second)
-    url := "http://localhost:3000/api/datasources"
-    b, err := json.Marshal(dss)
-    if err != nil {
-        fmt.Println(err)
-        return
-    }
-    req, _ := http.NewRequest("POST", url, bytes.NewBuffer(b))
-    req.Header.Set("Content-Type", "application/json")
+	servicewatch := getWatch()
+	watchLoop(servicewatch)
+}
+func RemoveDataSource(podname string) {
+	fmt.Println("--- DELETE SERVICE ---")
+	url := "http://localhost:3000/api/datasources/name/" + podname
+	req, _ := http.NewRequest("DELETE", url, nil)
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	var bufferDelete bytes.Buffer
+	resp.Write(&bufferDelete)
+	fmt.Println(string(bufferDelete.Bytes()))
+}
+func AddDataSource(ds Datasource) {
+	fmt.Println("--- ADD SERVICE ---")
+	url := "http://localhost:3000/api/datasources"
+	b, err := json.Marshal(ds)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(b))
+	req.Header.Set("Content-Type", "application/json")
 
-    client := &http.Client{}
-    resp, err := client.Do(req)
-    if err != nil {
-        fmt.Println(err)
-        return
-    }
-    defer resp.Body.Close()
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer resp.Body.Close()
 
-    fmt.Println("response Status:", resp.Status)
-    fmt.Println("response Headers:", resp.Header)
-    body, _ := ioutil.ReadAll(resp.Body)
-    fmt.Println("response Body:", string(body))
-
-    fmt.Printf("%+v", dss)
+	fmt.Println("response Status:", resp.Status)
+	fmt.Println("response Headers:", resp.Header)
+	body, _ := ioutil.ReadAll(resp.Body)
+	fmt.Println("response Body:", string(body))
 }
